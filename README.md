@@ -14,6 +14,251 @@ The architecture is described in [Paper 1: Agent Memory Infrastructure](papers/P
 
 ---
 
+## System Overview
+
+SAGE is a Go monorepo for persistent, consensus-validated agent memory. The
+default deployment is one binary, `sage-gui`
+([cmd/sage-gui/main.go:main](cmd/sage-gui/main.go), serve path
+[cmd/sage-gui/node.go:runServe](cmd/sage-gui/node.go)), which runs an
+in-process CometBFT node, the ABCI memory application
+([internal/abci/app.go:NewSageAppWithStores](internal/abci/app.go)), a SQLite
+off-chain projection ([internal/store/sqlite.go:NewSQLiteStore](internal/store/sqlite.go)),
+the REST API ([api/rest/server.go:NewServer](api/rest/server.go)), the
+embedded CEREBRUM dashboard ([web/embed.go](web/embed.go),
+`//go:embed all:static`), an optional TLS listener, and a stdio MCP server
+whose registered `sage_*` tools are enumerated in
+[internal/mcp/tools.go](internal/mcp/tools.go). The split multi-node
+deployment instead runs `amid` ([cmd/amid/main.go](cmd/amid/main.go)), which
+serves the same ABCI app through CometBFT's socket ABCI server
+(`abciserver.NewServer`) with a PostgreSQL off-chain store (`NewSageApp`).
+
+Canonical chain state — including the SHA-256 content hash of every memory —
+lives in BadgerDB ([internal/store/badger.go:BadgerStore](internal/store/badger.go));
+full memory content lives off-chain in SQLite or PostgreSQL
+([internal/store/store.go:MemoryStore](internal/store/store.go) /
+[OffchainStore](internal/store/store.go)). `FinalizeBlock` only queues writes
+([internal/abci/app.go:finalizeBlockUncommitted](internal/abci/app.go)); the
+batch flushes to the off-chain store inside `Commit`
+([internal/abci/app.go:SageApp.Commit](internal/abci/app.go)), which keeps
+AppHash computation independent of memory content. CometBFT itself is
+replaced by an audited local source subset at `third_party/cometbft`
+([go.mod:replace github.com/cometbft/cometbft](go.mod)) carrying six
+documented state-sync overlays
+([third_party/cometbft/README-SAGE.md](third_party/cometbft/README-SAGE.md)).
+
+Supporting surfaces: a Python SDK ([sdk/python](sdk/python),
+`sage_sdk.SageClient` / `AsyncSageClient` / `AgentIdentity`), the optional
+self-hosted libp2p connectivity service Natter ([natter](natter), its own Go
+module), the Tauri desktop shell ([desktop/sage-shell](desktop/sage-shell)),
+a Chrome extension ([extension](extension)), deployment assets
+([deploy](deploy)), and memory-benchmark harnesses ([bench](bench)). All
+clients sign REST requests with one canonical scheme — Ed25519 over
+`sha256("METHOD /path\n" + body)` followed by a big-endian int64 timestamp
+and nonce ([internal/auth/ed25519.go:buildRequestMessage](internal/auth/ed25519.go);
+mirrored byte-for-byte in
+[sdk/python/src/sage_sdk/auth.py:AgentIdentity.sign_request](sdk/python/src/sage_sdk/auth.py)).
+
+## Subdirectories & System Boundaries
+
+- **api/** — Client-facing contracts: OpenAPI 3.1 spec (97 paths, release-versioned,
+  [api/openapi.yaml](api/openapi.yaml)), protobuf query/tx envelopes
+  ([api/proto/sage/v1/tx.proto](api/proto/sage/v1/tx.proto),
+  [query.proto](api/proto/sage/v1/query.proto)), and the chi REST server with
+  auth middleware ([api/rest/server.go:Server.Router](api/rest/server.go),
+  [api/rest/middleware/auth.go](api/rest/middleware/auth.go)).
+- **backups/** — Local binary artifact only (a prior `sage-gui` copy); not a build
+  input and carries no source contract.
+- **bench/** — Memory benchmark harnesses: LoCoMo
+  ([./bench/locomo/README.md](bench/locomo/README.md)), LongMemEval
+  ([./bench/longmemeval/README.md](bench/longmemeval/README.md)), and a
+  llama.cpp rerank sidecar ([./bench/rerank-server/README.md](bench/rerank-server/README.md));
+  scored results land in `bench/results/`.
+- **bin/** — Gitignored build output for `amid`, `sage-gui`, `sage-cli`
+  (`Makefile:build-all`); not source.
+- **cmd/** — Entry points: `sage-gui` (personal node, MCP, hooks — CLI surface in
+  [cmd/sage-gui/main.go:printUsage](cmd/sage-gui/main.go)), `amid` (validator
+  ABCI server), `sage-cli` (`keygen|status|health|version`,
+  [cmd/sage-cli/main.go:main](cmd/sage-cli/main.go)), `sage-launcher`,
+  `sage-update-helper` (macOS recovery owner), `sage-tray` (Swift dock app),
+  `sage-embedding-bench`, and the build-tag-gated `v119-governance-fixture`
+  (only built under `v119testfixture`).
+- **deploy/** — Compose stacks (4-node devnet: postgres + abci0–3 + cometbft0–3 +
+  ollama in [deploy/docker-compose.yml](deploy/docker-compose.yml)), PostgreSQL
+  DDL ([deploy/init.sql](deploy/init.sql): `uuid-ossp` + `vector` extensions and
+  30 tables incl. `memories`, `validation_votes`, `abci_projection_batches`),
+  node images, monitoring, fault-gate runbooks
+  ([deploy/scripts](deploy/scripts)), and the versioned federation acceptance
+  harness ([./deploy/federation-acceptance/README.md](deploy/federation-acceptance/README.md)).
+- **desktop/** — Native Tauri shell `sage-shell`
+  ([desktop/sage-shell/tauri.conf.json](desktop/sage-shell/tauri.conf.json),
+  [src/main.rs](desktop/sage-shell/src/main.rs)) that sidecars the `sage-gui`
+  daemon; contract in [docs/native-app-daemon-contract.md](docs/native-app-daemon-contract.md).
+- **docs/** — Published documentation index ([./docs/README.md](docs/README.md)),
+  architecture & deployment ([docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)),
+  getting started, upgrading, and the code-verified `docs/reference/` tree
+  whose `` `symbol` + `file.go:line` `` citations are enforced by
+  [scripts/doc-citations.mjs](scripts/doc-citations.mjs).
+- **e2e/** — Playwright browser specs against the dashboard on
+  `http://localhost:8080` ([playwright.config.js](playwright.config.js),
+  [e2e/dashboard.spec.js](e2e/dashboard.spec.js) and peers).
+- **extension/** — Chrome MV3 extension "SAGE Memory for AI"
+  ([extension/chrome/manifest.json](extension/chrome/manifest.json); guide
+  [./extension/chrome/README.md](extension/chrome/README.md)).
+- **installer/** — Per-OS packaging: Linux
+  ([installer/linux/install.sh](installer/linux/install.sh)), macOS DMG
+  ([installer/macos/build-dmg.sh](installer/macos/build-dmg.sh)), Windows NSIS
+  ([installer/windows/sage-installer.nsi](installer/windows/sage-installer.nsi)).
+- **integrations/** — Tracked experiment protocol for the 50-vs-50 memory study
+  ([integrations/levelup/experiment_protocol.py](integrations/levelup/experiment_protocol.py));
+  Level Up experiment-specific code is intentionally excluded by `.gitignore`.
+- **internal/** — All private Go packages: ABCI app + the app-version fork ladder
+  (through app-v27, [internal/abci/app.go:maxSupportedAppVersion](internal/abci/app.go)),
+  stores ([internal/store](internal/store)), federation mTLS transport
+  ([internal/federation/types.go](internal/federation/types.go)), MCP server
+  ([internal/mcp](internal/mcp)), memory auto-voter
+  ([internal/voter/decision.go](internal/voter/decision.go)), PoE weighting
+  ([internal/poe/engine.go:ComputeWeight](internal/poe/engine.go)), embeddings,
+  statesync ([internal/statesync/format.go](internal/statesync/format.go)),
+  local snapshots ([internal/snapshot/snapshot.go](internal/snapshot/snapshot.go)),
+  vault encryption ([internal/vault/vault.go](internal/vault/vault.go)),
+  governance, and the tx codec ([internal/tx/codec.go:EncodeTx](internal/tx/codec.go)).
+- **natter/** — Optional self-hosted libp2p connectivity service (rendezvous,
+  AutoNAT, DCUtR hole-punch coordination, Circuit Relay v2) as its own Go
+  module; see [./natter/README.md](natter/README.md).
+- **papers/** — Research PDFs behind the protocol ([./papers/README.md](papers/README.md)).
+- **sage-memory/** — Installable agent skill wrapping the MCP memory lifecycle
+  ([./sage-memory/SKILL.md](sage-memory/SKILL.md)); its `sage_*` tool names map
+  onto registrations in [internal/mcp/tools.go](internal/mcp/tools.go).
+- **sdk/** — Python SDK `sage-agent-sdk` (sync/async clients + Ed25519 request
+  signing); documented in [./sdk/python/README.md](sdk/python/README.md).
+- **scripts/** — Release and quality gates: native-shell compile gate
+  ([scripts/native-shell-quality.sh](scripts/native-shell-quality.sh)), CodeQL
+  baseline filtering ([scripts/filter-codeql-sarif.mjs](scripts/filter-codeql-sarif.mjs)),
+  doc-citation resolver ([scripts/doc-citations.mjs](scripts/doc-citations.mjs)),
+  and 29 `*.test.mjs` Node contract tests run by `npm test`.
+- **test/** — Build-tagged suites: `integration` (`//go:build integration`,
+  test/integration) and `byzantine` (`//go:build byzantine`, test/byzantine),
+  plus the signed load test ([test/benchmark/load_test.py](test/benchmark/load_test.py)).
+- **third_party/** — Audited CometBFT v0.38.23 source subset with six state-sync
+  overlays and its regression gate
+  ([./third_party/cometbft/README-SAGE.md](third_party/cometbft/README-SAGE.md)).
+- **web/** — CEREBRUM dashboard: Go handler package
+  ([web/handler.go:NewDashboardHandler](web/handler.go)) embedding
+  [web/static](web/static) via `//go:embed all:static`, vendored Preact/htm JS
+  ([web/static/js/vendor](web/static/js/vendor)), and the restart/update
+  machinery ([web/restart.go:RestartProcess](web/restart.go),
+  [web/update_handler.go:ReconcilePreparedPendingBinaryUpdate](web/update_handler.go)).
+
+## Global Invariants
+
+- **Deterministic consensus execution.** The state machine in
+  [internal/abci/app.go:finalizeBlockUncommitted](internal/abci/app.go) forbids
+  `time.Now()`, unsorted map iteration, goroutines, and external I/O beyond the
+  supplied Badger view (enforced by its in-code invariant comment);
+  `make determinism` ([deploy/scripts/run-determinism.sh](deploy/scripts/run-determinism.sh))
+  asserts byte-identical AppHash across a 4-node devnet.
+- **Off-chain writes only in Commit.** `FinalizeBlock` accumulates
+  `pendingWrites`; the atomic SQLite/PostgreSQL flush runs inside
+  [internal/abci/app.go:SageApp.Commit](internal/abci/app.go) after consensus
+  commits and before `SaveState` — a flush failure panics rather than allowing
+  Badger/projection divergence (see the in-`Commit` comment block).
+- **Hashes on-chain, content off-chain.** Canonical `memory:<id>` Badger records
+  carry the 32-byte SHA-256 content hash, and hash-preserving status
+  transitions refuse missing/malformed hashes
+  ([internal/store/badger.go:ErrMemoryHashUnavailable](internal/store/badger.go),
+  `ErrMemoryHashMalformed`).
+- **Federation never writes chain state.** Cross-network results are merged
+  into REST responses only — never into memory writes, BadgerDB, or anything
+  AppHash-visible ([internal/federation/types.go](internal/federation/types.go)
+  package doc); the federation mTLS listener is a separate port and router
+  from the local API ([cmd/sage-gui/node.go:runServe](cmd/sage-gui/node.go)).
+- **One node, one vote.** The memory auto-voter signs each `MemoryVote` tx with
+  the node's single consensus validator key and counts toward the same 2/3
+  quorum as a multi-node network; `voter.required=true` refuses to serve
+  voter-less ([internal/voter/decision.go](internal/voter/decision.go) package
+  doc; runs-or-exits gate in [cmd/sage-gui/node.go:runServe](cmd/sage-gui/node.go)).
+- **State-sync snapshots carry no local secrets.**
+  [internal/statesync/format.go](internal/statesync/format.go) holds only a
+  chunked deterministic key/value image plus canonical public metadata and is
+  deliberately unrelated to the local rollback bundle in
+  [internal/snapshot/snapshot.go](internal/snapshot/snapshot.go) (SQLite,
+  keys, vault material), which must never cross the network.
+- **Single canonical request-signing scheme.** Every client signs
+  `sha256("METHOD /path\n" + body) + big-endian int64 timestamp + nonce` with
+  Ed25519 ([internal/auth/ed25519.go:buildRequestMessage](internal/auth/ed25519.go));
+  the Python SDK and MCP server produce byte-identical messages
+  ([sdk/python/src/sage_sdk/auth.py:AgentIdentity.sign_request](sdk/python/src/sage_sdk/auth.py),
+  [internal/mcp/server.go](internal/mcp/server.go)).
+- **CEREBRUM loopback boundary.** The dashboard rejects non-loopback peers and
+  forwarded hops; only the `Host` header may additionally name localhost, a
+  loopback IP, or exact operator-listed hostnames from
+  `SAGE_ALLOWED_CEREBRUM_HOSTS` — deliberately no wildcards
+  ([web/trusted_hosts.go:hostIsTrustedCEREBRUMHost](web/trusted_hosts.go),
+  [hostIsAllowedBrowserHost](web/trusted_hosts.go)).
+- **Vendored consensus integrity.** `go.mod` replaces CometBFT with the local
+  subset ([go.mod:replace github.com/cometbft/cometbft](go.mod));
+  [.gitattributes](.gitattributes) pins `third_party/cometbft/** -whitespace`
+  byte-for-byte, and `make test-cometbft-patch` is the overlay regression gate
+  ([third_party/cometbft/README-SAGE.md](third_party/cometbft/README-SAGE.md)).
+- **Release-version alignment.** [scripts/version-alignment.test.mjs](scripts/version-alignment.test.mjs)
+  (run by `npm test`) pins one version across `server.json`,
+  [api/openapi.yaml](api/openapi.yaml), `sdk/python`, `desktop/sage-shell`,
+  `web/static/js/app.js`, `docs/reference/*`, and this README's
+  `## What's New in v<version>` headers; it also asserts specific prose
+  markers in this README — keep the changelog sections intact.
+- **Instance exclusivity.** `sage-gui serve` owns
+  `$SAGE_HOME/sage.instance.lock` via flock and coordinates restarts through it
+  ([cmd/sage-gui/instance_lock_unix.go:acquireInstanceLock](cmd/sage-gui/instance_lock_unix.go)).
+
+## Global Side Effects
+
+- Filesystem under `SAGE_HOME` (default `~/.sage`,
+  [cmd/sage-gui/config.go:SageHome](cmd/sage-gui/config.go)): `data/badger/`
+  (canonical state), `data/sage.db` (SQLite projection), `data/cometbft/`
+  (chain + keys), `agent.key`, vault material, and the instance lock.
+- Network listeners started by `runServe`: REST `127.0.0.1:8080`
+  ([cmd/sage-gui/config.go:DefaultConfig](cmd/sage-gui/config.go)), TLS
+  `127.0.0.1:8443` (personal) / `0.0.0.0:8443` (quorum), federation mTLS
+  default `0.0.0.0:8444`
+  ([cmd/sage-gui/node.go:defaultFederationListenAddr](cmd/sage-gui/node.go)),
+  plus CometBFT P2P/RPC under the node home.
+- Embeddings and reranking reach local or configured HTTP services: Ollama, an
+  OpenAI-compatible endpoint, or the hash-provider fallback
+  ([cmd/sage-gui/node.go:createEmbeddingProvider](cmd/sage-gui/node.go)); the
+  managed reranker downloads and execs a prebuilt llama.cpp `llama-server`
+  ([internal/rerankd](internal/rerankd); rationale in [Dockerfile](Dockerfile)).
+- [docker-compose.sage-gui.yml](docker-compose.sage-gui.yml) pulls
+  `ollama/ollama` and downloads the `nomic-embed-text` model (~274 MB) on
+  first run; [deploy/docker-compose.yml](deploy/docker-compose.yml) stands up
+  postgres + 4 ABCI + 4 CometBFT containers, and
+  [deploy/init.sql](deploy/init.sql) enables the `uuid-ossp` and `vector`
+  extensions and creates the off-chain tables.
+- Releases publish to GHCR, PyPI, GitHub Releases, and the MCP registry
+  ([.github/workflows/release.yml](.github/workflows/release.yml);
+  [.goreleaser.yaml](.goreleaser.yaml)).
+
+## System Verification
+
+- Run: `make test` — full Go unit suite
+  (`go test ./... -v -count=1 -race -timeout 30m`; CI runs the no-race variant
+  plus targeted `-race` packages, see
+  [.github/workflows/ci.yml](.github/workflows/ci.yml)).
+- `make test-cometbft-patch` — CometBFT overlay regression
+  ([third_party/cometbft](third_party/cometbft)).
+- `make lint` — golangci-lint ([.golangci.yml](.golangci.yml)).
+- `npm test` — static-JS check plus the 29 `*.test.mjs` contract tests:
+  version alignment, doc-citation resolution, SSE wiring, federation route
+  state, release workflows ([package.json](package.json)).
+- `make sdk-test` — Python SDK suite (`cd sdk/python && pytest`,
+  `Makefile:sdk-test`).
+- `make integration` / `make byzantine` — build-tagged suites; require a
+  running testnet first (`make init && make up` via
+  [deploy/init-testnet.sh](deploy/init-testnet.sh)).
+- `npx playwright test` — dashboard e2e against `http://localhost:8080`
+  ([playwright.config.js](playwright.config.js)).
+
+---
+
 ## Architecture
 
 ```
